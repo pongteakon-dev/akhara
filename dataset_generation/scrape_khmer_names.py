@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build a Khmer name corpus from the Perchance name generator source.
+"""Build a Khmer name-part corpus from the Perchance name generator source.
 
 This script pulls the generator payload from:
 https://perchance.org/api/downloadGenerator?generatorName=namegen-as-kh
 
 It extracts masculine names (nameM), feminine names (nameF), and surnames,
-keeps Khmer Unicode only, randomizes names, and writes a CSV file.
+keeps Khmer Unicode only, deduplicates snippets, and writes a CSV file.
 """
 
 from __future__ import annotations
@@ -103,76 +103,123 @@ def parse_weighted_names(section_text: str) -> list[WeightedName]:
     return names
 
 
-def choose_weighted(rng: random.Random, pool: list[WeightedName]) -> str:
-    choice = rng.choices(pool, weights=[item.weight for item in pool], k=1)[0]
-    return choice.text
+def load_existing_snippets(existing_csv: Path | None) -> set[str]:
+    if existing_csv is None or not existing_csv.exists():
+        return set()
+
+    known: set[str] = set()
+    with existing_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        preferred_columns = (
+            "name_part",
+            "text",
+            "khmer_name",
+            "name",
+            "word",
+            "khmer_word",
+        )
+
+        for row in reader:
+            if not row:
+                continue
+
+            values: list[str] = []
+            for column in preferred_columns:
+                value = row.get(column)
+                if value:
+                    values.append(value)
+
+            if not values:
+                values = [str(v) for v in row.values() if v]
+
+            for value in values:
+                for token in str(value).split():
+                    khmer_only = "".join(KHMER_RE.findall(token))
+                    if is_valid_name_part(khmer_only):
+                        known.add(khmer_only)
+
+    return known
 
 
-def generate_rows(
-    count: int,
+def generate_snippet_rows(
     surnames: list[WeightedName],
     male_names: list[WeightedName],
     female_names: list[WeightedName],
     seed: int | None,
+    max_count: int,
     unique: bool,
-) -> list[tuple[int, str, str]]:
+    existing_snippets: set[str],
+) -> list[tuple[int, str]]:
+    snippets: list[str] = []
+    seen_texts: set[str] = set(existing_snippets)
+
+    for item in surnames:
+        text = " ".join(item.text.split())
+        if not is_valid_name_part(text):
+            continue
+        if unique and text in seen_texts:
+            continue
+        snippets.append(text)
+        seen_texts.add(text)
+
+    for item in male_names:
+        text = " ".join(item.text.split())
+        if not is_valid_name_part(text):
+            continue
+        if unique and text in seen_texts:
+            continue
+        snippets.append(text)
+        seen_texts.add(text)
+
+    for item in female_names:
+        text = " ".join(item.text.split())
+        if not is_valid_name_part(text):
+            continue
+        if unique and text in seen_texts:
+            continue
+        snippets.append(text)
+        seen_texts.add(text)
+
     rng = random.Random(seed)
-    rows: list[tuple[int, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    rng.shuffle(snippets)
 
-    max_attempts = count * 50 if unique else count
-    attempts = 0
-    while len(rows) < count and attempts < max_attempts:
-        attempts += 1
-        gender = rng.choice(["male", "female"])
-        given_pool = male_names if gender == "male" else female_names
+    if max_count > 0:
+        snippets = snippets[:max_count]
 
-        surname = choose_weighted(rng, surnames)
-        given_name = choose_weighted(rng, given_pool)
-        if not is_valid_name_part(surname) or not is_valid_name_part(given_name):
-            continue
-
-        full_name = f"{surname} {given_name}"
-        full_name = " ".join(full_name.split())
-        key = (gender, full_name)
-
-        if unique and key in seen:
-            continue
-
-        seen.add(key)
-        rows.append((len(rows) + 1, gender, full_name))
-
-    return rows
+    return [(index, snippet) for index, snippet in enumerate(snippets, start=1)]
 
 
-def write_csv(rows: list[tuple[int, str, str]], output_path: Path) -> None:
+def write_csv(rows: list[tuple[int, str]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "gender", "khmer_name"])
+        writer.writerow(["id", "text"])
         writer.writerows(rows)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Scrape Khmer names from the Perchance generator source, randomize "
-            "male/female full names, and export CSV."
+            "Scrape Khmer name snippets from the Perchance generator source, "
+            "deduplicate surname/given-name items, and export CSV."
         )
     )
     parser.add_argument(
         "-n",
         "--count",
         type=int,
-        default=1000,
-        help="Number of randomized names to generate (default: 1000)",
+        default=0,
+        help=(
+            "Maximum number of snippets to export after deduplication "
+            "(default: 0, export all)"
+        ),
     )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        default=Path("khmer_name_corpus.csv"),
-        help="Output CSV path (default: khmer_name_corpus.csv)",
+        default=Path("khmer_name_parts.csv"),
+        help="Output CSV path (default: khmer_name_parts.csv)",
     )
     parser.add_argument(
         "--seed",
@@ -183,15 +230,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-duplicates",
         action="store_true",
-        help="Allow duplicate randomized names in output",
+        help="Allow duplicate snippets across surname/given-name pools",
+    )
+    parser.add_argument(
+        "--existing-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CSV path of existing items; overlapping Khmer snippets "
+            "will be skipped"
+        ),
     )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.count <= 0:
-        print("--count must be > 0", file=sys.stderr)
+    if args.count < 0:
+        print("--count must be >= 0", file=sys.stderr)
         return 2
 
     try:
@@ -204,18 +260,21 @@ def main() -> int:
         female_names = parse_weighted_names(female_section)
         surnames = parse_weighted_names(surname_section)
 
-        rows = generate_rows(
-            count=args.count,
+        existing_snippets = load_existing_snippets(args.existing_csv)
+
+        rows = generate_snippet_rows(
             surnames=surnames,
             male_names=male_names,
             female_names=female_names,
             seed=args.seed,
+            max_count=args.count,
             unique=not args.allow_duplicates,
+            existing_snippets=existing_snippets,
         )
-        if len(rows) < args.count:
+        if args.count > 0 and len(rows) < args.count:
             print(
                 (
-                    f"Requested {args.count} names, generated {len(rows)} unique rows. "
+                    f"Requested {args.count} snippets, generated {len(rows)} rows. "
                     "Use --allow-duplicates if you need more rows."
                 ),
                 file=sys.stderr,

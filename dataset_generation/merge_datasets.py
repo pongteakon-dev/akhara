@@ -1,21 +1,37 @@
 import csv
 
 rows = []
-max_translated_id = 0
+next_id = 1
 
 with open("dataset_generation/translated_nouns.csv", newline="", encoding="utf-8") as f:
     for row in csv.DictReader(f):
-        rows.append({"id": row["id"], "khmer_text": row["translation"]})
-        max_translated_id = max(max_translated_id, int(row["id"]))
+        text = row["translation"].strip()
+        if not text:
+            continue
+
+        rows.append({"id": str(next_id), "khmer_text": text})
+        next_id += 1
 
 with open("dataset_generation/khmer_name_corpus.csv", newline="", encoding="utf-8") as f:
     for row in csv.DictReader(f):
-        new_id = int(row["id"]) + max_translated_id
-        rows.append({"id": str(new_id), "khmer_text": row["khmer_name"]})
+        name_text = row.get("text", row.get("khmer_name", "")).strip()
+        if not name_text:
+            continue
+
+        rows.append({"id": str(next_id), "khmer_text": name_text})
+        next_id += 1
+
+with open("CambodiaDistrictList2025.csv", newline="", encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        district_text = row["district_kh"].strip()
+        if not district_text:
+            continue
+
+        rows.append({"id": str(next_id), "khmer_text": district_text})
+        next_id += 1
 
 with open("dataset_generation/merged_corpus.csv", "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=["id", "khmer_text"])
     writer.writeheader()
     writer.writerows(rows)
-    
 print(f"Done. {len(rows)} rows written to dataset_generation/merged_corpus.csv")

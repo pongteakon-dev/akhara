@@ -26,8 +26,8 @@ from transformers import CanineModel, CanineTokenizer
 
 torch.cuda.empty_cache()
 OUTPUT_MAX_LEN = 95 #+ 2  # <GO>+groundtruth+<END>
-IMG_WIDTH = 256
-IMG_HEIGHT = 64
+IMG_WIDTH = 256     # 960: Akhara, 256: IAM
+IMG_HEIGHT = 64     # 384: Akhara, 64: IAM
 
 c_classes = '_!"#&\'()*+,-./0123456789:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '
 cdict = {c:i for i,c in enumerate(c_classes)}
