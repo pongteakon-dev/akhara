@@ -23,7 +23,7 @@ with open("dataset_generation/khmer_name_corpus.csv", newline="", encoding="utf-
 
 with open("CambodiaDistrictList2025.csv", newline="", encoding="utf-8") as f:
     for row in csv.DictReader(f):
-        district_text = row["district_kh"].strip()
+        district_text = row.get("khmer_text", row.get("district_kh", "")).strip()
         if not district_text:
             continue
 

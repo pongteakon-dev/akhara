@@ -506,6 +506,5 @@ def main():
     print("  python extract_boxes.py --writer-id-start 3")
     print("  (id column auto-continues from last row in dataset.csv)")
 
-
 if __name__ == '__main__':
     main()
