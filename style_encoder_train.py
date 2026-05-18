@@ -20,6 +20,7 @@ import timm
 import cv2
 import time
 import json
+import csv
 import random
 
 
@@ -110,7 +111,7 @@ class WordStyleDataset(Dataset):
         basefolder: str = 'datasets/',                #Root folder
         subset: str = 'all',                          #Name of dataset subset to be loaded. (e.g. 'all', 'train', 'test', 'fold1', etc.)
         segmentation_level: str = 'line',             #Type of data to load ('line' or 'word')
-        fixed_size: tuple =(128, None),               #Resize inputs to this size
+        fixed_size: tuple =(384, 960),                #Resize inputs to this size, Used to be tuple = (128, None)
         transforms: list = None,                      #List of augmentation transform functions to be applied on each input
         character_classes: list = None,               #If 'None', these will be autocomputed. Otherwise, a list of characters is expected.
         ):
@@ -159,17 +160,17 @@ class WordStyleDataset(Dataset):
         img_pos = Image.open(positive).convert('RGB') #image_resize_PIL(positive, height=positive.height // 2)
         img_neg = Image.open(negative).convert('RGB') #image_resize_PIL(negative, height=negative.height // 2)
         
-        if img.height < 64 and img.width < 256:
+        if img.height < 384 and img.width < 960:
             img = img
         else:
             img = image_resize_PIL(img, height=img.height // 2)
         
-        if img_pos.height < 64 and img_pos.width < 256:
+        if img_pos.height < 384 and img_pos.width < 960:
             img_pos = img_pos
         else:
             img_pos = image_resize_PIL(img_pos, height=img_pos.height // 2)
         
-        if img_neg.height < 64 and img_neg.width < 256:
+        if img_neg.height < 384 and img_neg.width < 960:
             img_neg = img_neg
         else:
             img_neg = image_resize_PIL(img_neg, height=img_neg.height // 2)
@@ -305,7 +306,7 @@ class WordLineDataset(Dataset):
         basefolder: str = 'datasets/',                #Root folder
         subset: str = 'all',                          #Name of dataset subset to be loaded. (e.g. 'all', 'train', 'test', 'fold1', etc.)
         segmentation_level: str = 'line',             #Type of data to load ('line' or 'word')
-        fixed_size: tuple =(128, None),               #Resize inputs to this size
+        fixed_size: tuple =(384, 960),                #Resize inputs to this size, Used to be (128, None)
         transforms: list = None,                      #List of augmentation transform functions to be applied on each input
         character_classes: list = None,               #If 'None', these will be autocomputed. Otherwise, a list of characters is expected.
         ):
@@ -403,9 +404,9 @@ class WordLineDataset(Dataset):
             style_images = [i[0] for i in random_samples]
         else:
             # Handle the case where there are fewer than 5 matching images (if needed)
-            #print("Not enough matching images with writer ID", wid)
+            print("Not enough matching images with writer ID", wid)
             positive_samples_ = [p for p in self.data if p[2] == wid]
-            #print('len positive samples', len(positive_samples_), 'wid', wid)
+            print('len positive samples', len(positive_samples_), 'wid', wid)
             random_samples_ = random.sample(positive_samples_, k=5)
             # Retrieve the corresponding images
             style_images = [i[0] for i in random_samples_]
@@ -440,8 +441,8 @@ class WordLineDataset(Dataset):
         #img = image_resize_PIL(img, height=int(1.0 * nheight), width=int(1.0 * nwidth))
         #img = centered_PIL(img, (fheight, fwidth), border_value=None).convert('L')
         
-            #image = image.resize((256, 64), Image.ANTIALIAS)
-        if img.width < 256:
+            #image = image.resize((256, 128), Image.ANTIALIAS)
+        if img.width < 960:
             img = ImageOps.pad(img, size=(960, 384), color= "white")#, centering=(0,0)) uncommment to pad right
         #print('img', img.mode, img.size)
         
@@ -646,6 +647,151 @@ class LineListIO(object):
                 f.write(l + '\n')
 
 
+class KhmerCsvDataset(Dataset):
+    def __init__(
+        self,
+        csv_path,
+        basefolder,
+        fixed_size=(384, 960),
+        transforms=None,
+        subset="all",
+        seed=42,
+    ):
+        self.csv_path = csv_path
+        self.basefolder = basefolder
+        self.fixed_size = fixed_size
+        self.transforms = transforms
+        self.subset = subset
+        self.seed = seed
+
+        with open(self.csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            self.rows = list(reader)
+
+        self.character_classes, self.max_transcr_len = self._build_character_classes()
+        self.writer_ids = sorted({int(r["writer_id"]) for r in self.rows})
+        self.writer_id_to_index = {wid: idx for idx, wid in enumerate(self.writer_ids)}
+        self.wclasses = len(self.writer_ids)
+
+    def _build_character_classes(self):
+        res = set()
+        max_len = 0
+        for r in self.rows:
+            transcr = r["label"]
+            res.update(list(transcr))
+            max_len = max(max_len, len(transcr))
+        res = sorted(list(res))
+        res.append(" ")
+        if "<PAD>" not in res:
+            res.append("<PAD>")
+        return res, max_len
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        row = self.rows[index]
+        img_path = row["image_path"]
+        transcr = row["label"]
+        wid = int(row["writer_id"])
+        wid_idx = self.writer_id_to_index[wid]
+
+        full_path = os.path.join(self.basefolder, img_path)
+        img = Image.open(full_path).convert("RGB")
+
+        same_writer = [r for r in self.rows if int(r["writer_id"]) == wid and len(r["label"]) > 0]
+        diff_writer = [r for r in self.rows if int(r["writer_id"]) != wid and len(r["label"]) > 0]
+
+        positive_row = random.choice(same_writer)
+        negative_row = random.choice(diff_writer)
+
+        img_pos = Image.open(os.path.join(self.basefolder, positive_row["image_path"])).convert("RGB")
+        img_neg = Image.open(os.path.join(self.basefolder, negative_row["image_path"])).convert("RGB")
+
+        fheight, fwidth = self.fixed_size[0], self.fixed_size[1]
+
+        if img.width < 960:
+            img = ImageOps.pad(img, size=(960, 384), color="white")
+
+        nheight, nwidth = img.height, img.width
+        nheight_pos, nwidth_pos = img_pos.height, img_pos.width
+        nheight_neg, nwidth_neg = img_neg.height, img_neg.width
+
+        nheight, nwidth = max(4, min(fheight - 16, nheight)), max(8, min(fwidth - 32, nwidth))
+        nheight_pos, nwidth_pos = max(4, min(fheight - 16, nheight_pos)), max(8, min(fwidth - 32, nwidth_pos))
+        nheight_neg, nwidth_neg = max(4, min(fheight - 16, nheight_neg)), max(8, min(fwidth - 32, nwidth_neg))
+
+        img = image_resize_PIL(img, height=int(1.0 * nheight), width=int(1.0 * nwidth))
+        img = centered_PIL(img, (fheight, fwidth), border_value=255.0)
+
+        img_pos = image_resize_PIL(img_pos, height=int(1.0 * nheight_pos), width=int(1.0 * nwidth_pos))
+        img_pos = centered_PIL(img_pos, (fheight, fwidth), border_value=255.0)
+
+        img_neg = image_resize_PIL(img_neg, height=int(1.0 * nheight_neg), width=int(1.0 * nwidth_neg))
+        img_neg = centered_PIL(img_neg, (fheight, fwidth), border_value=255.0)
+
+        if self.transforms is not None:
+            img = self.transforms(img)
+            img_pos = self.transforms(img_pos)
+            img_neg = self.transforms(img_neg)
+
+        char_tokens = [self.character_classes.index(c) for c in transcr]
+        pad_token_idx = self.character_classes.index("<PAD>")
+        max_len = 128
+        padding_length = max_len - len(char_tokens)
+        char_tokens.extend([pad_token_idx] * max(0, padding_length))
+        char_tokens = torch.tensor(char_tokens[:max_len], dtype=torch.long)
+
+        cla = self.character_classes
+
+        s_imgs = []
+        style_samples = random.sample(same_writer, k=min(5, len(same_writer)))
+        for s in style_samples:
+            s_img = Image.open(os.path.join(self.basefolder, s["image_path"])).convert("RGB")
+            s_img = image_resize_PIL(s_img, height=int(1.0 * nheight), width=int(1.0 * nwidth))
+            s_img = centered_PIL(s_img, (fheight, fwidth), border_value=255.0)
+            if self.transforms is not None:
+                s_img = self.transforms(s_img)
+            s_imgs.append(s_img)
+
+        s_imgs = torch.stack(s_imgs) if s_imgs else torch.empty(0)
+
+        return img, transcr, char_tokens, wid_idx, img_pos, img_neg, cla, s_imgs, img_path, img, img_pos, img_neg
+
+    def collate_fn(self, batch):
+        img, transcr, char_tokens, wid, positive, negative, cla, s_imgs, img_path, pixel_values_img, pixel_values_pos, pixel_values_neg = zip(*batch)
+
+        images_batch = torch.stack(img)
+        char_tokens_batch = torch.stack(char_tokens)
+        wid_tensor = torch.tensor(wid, dtype=torch.long)
+        images_pos = torch.stack(positive)
+        images_neg = torch.stack(negative)
+        s_imgs = torch.stack(s_imgs)
+        pixel_values_img = torch.stack(pixel_values_img)
+        pixel_values_pos = torch.stack(pixel_values_pos)
+        pixel_values_neg = torch.stack(pixel_values_neg)
+
+        return images_batch, transcr, char_tokens_batch, wid_tensor, images_pos, images_neg, cla, s_imgs, img_path, pixel_values_img, pixel_values_pos, pixel_values_neg
+
+
+def split_indices_by_writer(rows, val_ratio=0.2, seed=42):
+    rng = random.Random(seed)
+    writer_to_indices = {}
+    for idx, row in enumerate(rows):
+        wid = int(row["writer_id"])
+        writer_to_indices.setdefault(wid, []).append(idx)
+
+    train_indices = []
+    val_indices = []
+    for indices in writer_to_indices.values():
+        rng.shuffle(indices)
+        val_count = max(1, int(round(len(indices) * val_ratio)))
+        val_indices.extend(indices[:val_count])
+        train_indices.extend(indices[val_count:])
+
+    return train_indices, val_indices
+
+
 # FIXED — accept and forward character_classes
 class IAMDataset_style(WordLineDataset):
     def __init__(self, basefolder, subset, segmentation_level, fixed_size, transforms, character_classes=None):
@@ -754,9 +900,9 @@ class IAMDataset_style(WordLineDataset):
                 #print('img_path', img_path + '.png')
                 img = Image.open(img_path + '.png').convert('RGB') #.convert('L')
                 #print('img shape PIL', img.size)
-                #img = image_resize_PIL(img, height=64)
+                #img = image_resize_PIL(img, height=128)
                 
-                if img.height < 64 and img.width < 256:
+                if img.height < 384 and img.width < 960:
                     img = img
                 else:
                     img = image_resize_PIL(img, height=img.height // 2)
@@ -793,7 +939,7 @@ class Mixed_Encoder(nn.Module):
     """
 
     def __init__(
-        self, model_name='resnet50', num_classes=339, pretrained=True, trainable=True
+        self, model_name='resnet50', num_classes=2, pretrained=True, trainable=True
     ):
         super().__init__()
         self.model = timm.create_model(
@@ -848,7 +994,9 @@ def train_class_epoch(model, training_data, optimizer, args):
     for i, data in enumerate(pbar):
     
         image = data[0].to(args.device)
-        if args.dataset == 'iam':
+        if args.dataset == 'khmer':
+            label = data[3].to(args.device)
+        elif args.dataset == 'iam':
             label = data[2].to(args.device)
         
         optimizer.zero_grad()
@@ -885,7 +1033,9 @@ def eval_class_epoch(model, validation_data, args):
 
             image = data[0].to(args.device)   
             image_paths = data[4]
-            if args.dataset == 'iam':
+            if args.dataset == 'khmer':
+                label = data[3].to(args.device)
+            elif args.dataset == 'iam':
                 label = data[2].to(args.device)
 
             output = model(image)
@@ -922,7 +1072,11 @@ def train_epoch_triplet(train_loader, model, criterion, optimizer, device, args)
         
         img = data[0]
     
-        if args.dataset == 'iam':
+        if args.dataset == 'khmer':
+            wid = data[3]
+            positive = data[4]
+            negative = data[5]
+        elif args.dataset == 'iam':
             wid = data[2]
             #print('wid', wid)
             positive = data[3]
@@ -964,7 +1118,11 @@ def val_epoch_triplet(val_loader, model, criterion, optimizer, device, args):
         img = data[0]
         #transcr = data[1]
 
-        if args.dataset == 'iam':
+        if args.dataset == 'khmer':
+            wid = data[3]
+            positive = data[4]
+            negative = data[5]
+        elif args.dataset == 'iam':
             wid = data[2]
             positive = data[3]
             negative = data[4]
@@ -1263,7 +1421,7 @@ def main():
     '''Main function'''
     parser = argparse.ArgumentParser(description='Train Style Encoder')
     parser.add_argument('--model', type=str, default='mobilenetv2_100', help='type of cnn to use (resnet, densenet, etc.)')
-    parser.add_argument('--dataset', type=str, default='iam', help='dataset name')
+    parser.add_argument('--dataset', type=str, default='khmer', help='dataset name')
     parser.add_argument('--batch_size', type=int, default=320, help='input batch size for training')
     parser.add_argument('--epochs', type=int, default=20, required=False, help='number of training epochs')
     parser.add_argument('--pretrained', type=bool, default=False, help='use of feature extractor or not')
@@ -1278,62 +1436,94 @@ def main():
     if os.path.exists(args.save_path) == False:
         os.makedirs(args.save_path)
     
-    if args.dataset == 'iam':
-    
-        myDataset = IAMDataset_style
-        # dataset_folder = '/usr/share/datasets_ianos'
-        dataset_folder = '/path/to/iam_data/'
-        aug_transforms = [lambda x: affine_transformation(x, s=.1)]
-        
+    if args.dataset == 'khmer':
+
+        dataset_root = os.path.dirname(os.path.abspath(__file__))
+        csv_path = os.path.join(dataset_root, 'image_processing', 'dataset.csv')
+
         train_transform = transforms.Compose([
-                            #transforms.RandomHorizontalFlip(),
                             transforms.ToTensor(),
-                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) #transforms.Normalize((0.5,), (0.5,)),  #
+                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
                             ])
-        
+
         val_transform = transforms.Compose([
                             transforms.ToTensor(),
-                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) #transforms.Normalize((0.5,), (0.5,)),  #
+                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
                             ])
-        
-        #get khmer classes
-        khmer_classes = get_khmer_character_classes_with_coeng()
-        
-        #train_data = myDataset(dataset_folder, 'train', 'word', fixed_size=(1 * 64, 256), tokenizer=None, text_encoder=None, feat_extractor=None, transforms=train_transform, args=args)
-        train_data = myDataset(dataset_folder, 'train', 'word', fixed_size=(1 * 384, 960), transforms=train_transform)
-        
-        #print('len train data', len(train_data))
-        #split with torch.utils.data.Subset into train and val
-        validation_size = int(0.2 * len(train_data))
 
-        # Calculate the size of the training set
-        train_size = len(train_data) - validation_size
+        full_dataset = KhmerCsvDataset(
+            csv_path=csv_path,
+            basefolder=dataset_root,
+            fixed_size=(384, 960),
+            transforms=train_transform,
+        )
 
-        # Use random_split to split the dataset into train and validation sets
-        train_data, val_data = random_split(train_data, [train_size, validation_size], generator=torch.Generator().manual_seed(42))
+        train_indices, val_indices = split_indices_by_writer(full_dataset.rows, val_ratio=0.2, seed=42)
+        train_data = torch.utils.data.Subset(full_dataset, train_indices)
+        val_data = torch.utils.data.Subset(
+            KhmerCsvDataset(
+                csv_path=csv_path,
+                basefolder=dataset_root,
+                fixed_size=(384, 960),
+                transforms=val_transform,
+            ),
+            val_indices,
+        )
+
         print('len train data', len(train_data))
         print('len val data', len(val_data))
-        
-        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
-        
 
-        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
-        if val_loader is not None:
-            print('Val data')
-        else:
-            print('No validation data')
-            
-        style_classes = 339
+        train_loader = DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=full_dataset.collate_fn,
+        )
+
+        val_loader = DataLoader(
+            val_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=4,
+            collate_fn=full_dataset.collate_fn,
+        )
+
+        style_classes = full_dataset.wclasses
+
+    # IAM path retained for reference
+    # if args.dataset == 'iam':
+    #     myDataset = IAMDataset_style
+    #     dataset_folder = '/path/to/iam_data/'
+    #     aug_transforms = [lambda x: affine_transformation(x, s=.1)]
+    #     train_transform = transforms.Compose([
+    #                         transforms.ToTensor(),
+    #                         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #                         ])
+    #     val_transform = transforms.Compose([
+    #                         transforms.ToTensor(),
+    #                         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #                         ])
+    #     khmer_classes = get_khmer_character_classes_with_coeng()
+    #     train_data = myDataset(dataset_folder, 'train', 'word', fixed_size=(1 * 384, 960), transforms=train_transform)
+    #     validation_size = int(0.2 * len(train_data))
+    #     train_size = len(train_data) - validation_size
+    #     train_data, val_data = random_split(train_data, [train_size, validation_size], generator=torch.Generator().manual_seed(42))
+    #     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    #     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    #     style_classes = 2
     
-    else:
-        print('You need to add your own dataset and define the number of style classes!!!')
     
     
     
-    
+    use_mixed_encoder = args.mode == 'mixed'
+
     if args.model == 'mobilenetv2_100':
         print('Using mobilenetv2_100')
-        model = ImageEncoder(model_name='mobilenetv2_100', num_classes=style_classes, pretrained=True, trainable=True)
+        if use_mixed_encoder:
+            model = Mixed_Encoder(model_name='mobilenetv2_100', num_classes=style_classes, pretrained=True, trainable=True)
+        else:
+            model = ImageEncoder(model_name='mobilenetv2_100', num_classes=style_classes, pretrained=True, trainable=True)
         print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
         if args.pretrained == True:
             
@@ -1348,10 +1538,13 @@ def main():
         
     if args.model == 'resnet18':
         print('Using resnet18')
-        model = ImageEncoder(model_name=args.model, num_classes=style_classes, pretrained=True, trainable=True)
+        if use_mixed_encoder:
+            model = Mixed_Encoder(model_name=args.model, num_classes=style_classes, pretrained=True, trainable=True)
+        else:
+            model = ImageEncoder(model_name=args.model, num_classes=style_classes, pretrained=True, trainable=True)
         print('Model loaded')
         #change layer to have 1 channel instead of 3
-        #model.model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        #model.model.conv1 = nn.Conv2d(1, 128, kernel_size=7, stride=2, padding=3, bias=False)
         print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
         if args.pretrained == True:
             PATH = ''

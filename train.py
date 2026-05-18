@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, random_split
 import torchvision
 from tqdm import tqdm
@@ -11,6 +11,7 @@ import copy
 import argparse
 import uuid
 import json
+import csv
 from diffusers import AutoencoderKL, DDIMScheduler
 import random
 from unet import UNetModel
@@ -26,12 +27,47 @@ from transformers import CanineModel, CanineTokenizer
 
 torch.cuda.empty_cache()
 OUTPUT_MAX_LEN = 95 #+ 2  # <GO>+groundtruth+<END>
-IMG_WIDTH = 256     # 960: Akhara, 256: IAM
-IMG_HEIGHT = 64     # 384: Akhara, 64: IAM
+IMG_WIDTH = 960     # 960: Akhara, 256: IAM
+IMG_HEIGHT = 384    # 384: Akhara, 64: IAM
 
 c_classes = '_!"#&\'()*+,-./0123456789:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz '
 cdict = {c:i for i,c in enumerate(c_classes)}
 icdict = {i:c for i,c in enumerate(c_classes)}
+
+### Borrowed from GANwriting ###
+# def label_padding(labels, letter2index, num_tokens, pad_token, output_max_len):
+#     ll = [letter2index[i] for i in labels]
+#     ll = np.array(ll) + num_tokens
+#     ll = list(ll)
+#     num = output_max_len - len(ll)
+#     if num > 0:
+#         ll.extend([pad_token] * num)
+#     return ll
+#
+#
+# def build_label_dictionary(character_classes, write_json=True):
+#     letter2index = {label: n for n, label in enumerate(character_classes)}
+#     index2letter = {v: k for k, v in letter2index.items()}
+#     if write_json:
+#         with open("letter2index.json", "w", encoding="utf-8") as f:
+#             json.dump(letter2index, f, ensure_ascii=False)
+#         with open("index2letter.json", "w", encoding="utf-8") as f:
+#             json.dump(index2letter, f, ensure_ascii=False)
+#     return len(character_classes), letter2index, index2letter
+#
+#
+# char_classes, letter2index, index2letter = build_label_dictionary(list(c_classes))
+# tok = False
+# if not tok:
+#     tokens = {"PAD_TOKEN": char_classes}
+# else:
+#     tokens = {"GO_TOKEN": char_classes, "END_TOKEN": char_classes + 1, "PAD_TOKEN": char_classes + 2}
+# num_tokens = len(tokens.keys())
+# print('num_tokens', num_tokens)
+#
+#
+# print('num of character classes', char_classes)
+# vocab_size = char_classes + num_tokens
 
 ### Borrowed from GANwriting ###
 def label_padding(labels, num_tokens):
@@ -99,6 +135,25 @@ def save_images(images, path, args, **kwargs):
     im.save(path)
     return im
 
+
+def save_single_images(images, path, args):
+    if images.dim() == 4:
+        image = images[0]
+    else:
+        image = images
+
+    if args.latent is True:
+        im = torchvision.transforms.ToPILImage()(image)
+        if args.color is False:
+            im = im.convert('L')
+        else:
+            im = im.convert('RGB')
+    else:
+        ndarr = image.permute(1, 2, 0).to('cpu').numpy()
+        im = Image.fromarray(ndarr)
+    im.save(path)
+    return im
+
 def crop_whitespace_width(img):
     #tensor image to PIL
     original_height = img.height
@@ -109,6 +164,82 @@ def crop_whitespace_width(img):
     #rect = img.crop((x, 0, x + w, original_height))
     rect = img.crop((x, y, x + w, y + h))
     return np.array(rect)
+
+
+class KhmerDiffusionDataset(torch.utils.data.Dataset):
+    def __init__(self, csv_path, basefolder, fixed_size=(IMG_HEIGHT, IMG_WIDTH), transforms=None, seed=42):
+        self.csv_path = csv_path
+        self.basefolder = basefolder
+        self.fixed_size = fixed_size
+        self.transforms = transforms
+        self.seed = seed
+
+        with open(self.csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            self.rows = list(reader)
+
+        self.writer_ids = sorted({int(r["writer_id"]) for r in self.rows})
+        self.writer_id_to_index = {wid: idx for idx, wid in enumerate(self.writer_ids)}
+        self.wclasses = len(self.writer_ids)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _load_and_fit(self, rel_path):
+        full_path = os.path.join(self.basefolder, rel_path)
+        img = Image.open(full_path).convert("RGB")
+        if img.width < IMG_WIDTH:
+            img = ImageOps.pad(img, size=(IMG_WIDTH, IMG_HEIGHT), color="white")
+        img = image_resize_PIL(img, height=int(1.0 * IMG_HEIGHT), width=int(1.0 * IMG_WIDTH))
+        img = centered_PIL(img, (IMG_HEIGHT, IMG_WIDTH), border_value=255.0)
+        if self.transforms is not None:
+            img = self.transforms(img)
+        return img
+
+    def __getitem__(self, index):
+        row = self.rows[index]
+        img_path = row["image_path"]
+        transcr = row["label"]
+        wid = int(row["writer_id"])
+        wid_idx = self.writer_id_to_index[wid]
+
+        img = self._load_and_fit(img_path)
+
+        same_writer = [r for r in self.rows if int(r["writer_id"]) == wid and len(r["label"]) > 0]
+        style_samples = random.sample(same_writer, k=min(5, len(same_writer)))
+        style_imgs = [self._load_and_fit(s["image_path"]) for s in style_samples]
+        style_imgs = torch.stack(style_imgs)
+
+        cor_im = img
+
+        return img, transcr, torch.tensor(wid_idx, dtype=torch.long), style_imgs, img_path, cor_im
+
+
+def split_indices_by_writer(rows, val_ratio=0.2, seed=42):
+    rng = random.Random(seed)
+    writer_to_indices = {}
+    for idx, row in enumerate(rows):
+        wid = int(row["writer_id"])
+        writer_to_indices.setdefault(wid, []).append(idx)
+
+    train_indices = []
+    val_indices = []
+    for indices in writer_to_indices.values():
+        rng.shuffle(indices)
+        val_count = max(1, int(round(len(indices) * val_ratio)))
+        val_indices.extend(indices[:val_count])
+        train_indices.extend(indices[val_count:])
+
+    return train_indices, val_indices
+
+
+def build_character_classes_from_csv(csv_path):
+    res = set()
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            res.update(list(row["label"]))
+    return sorted(list(res))
 
 
 class AvgMeter:
@@ -163,7 +294,7 @@ class EMA:
 
 
 class Diffusion:
-    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=(64, 256), args=None):
+    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=(IMG_HEIGHT, IMG_WIDTH), args=None):
         self.noise_steps = noise_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
@@ -185,6 +316,7 @@ class Diffusion:
     def sampling_loader(self, model, test_loader, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None):
         model.eval()
         tensor_list = []
+        vae_model = vae.module if hasattr(vae, "module") else vae
         
         with torch.no_grad():
             pbar = tqdm(test_loader)
@@ -202,16 +334,18 @@ class Diffusion:
                     #print('transcr', transcr)
                     batch_word_embeddings = []
                     for trans in transcr:
-                        word_embedding = label_padding(trans) 
+                        # word_embedding = label_padding(trans, letter2index, num_tokens, tokens["PAD_TOKEN"], OUTPUT_MAX_LEN)
+                        word_embedding = label_padding(trans, num_tokens)
                         #print('word_embedding', word_embedding)
                         word_embedding = np.array(word_embedding, dtype="int64")
                         word_embedding = torch.from_numpy(word_embedding).long() 
                         batch_word_embeddings.append(word_embedding)
                     text_features = torch.stack(batch_word_embeddings).to(args.device)
                 else:
+                    # text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=args.text_max_length).to(args.device)
                     text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=200).to(args.device)
                 
-                reshaped_images = style_images.reshape(-1, 3, 64, 256)
+                reshaped_images = style_images.reshape(-1, 3, IMG_HEIGHT, IMG_WIDTH)
                 
                 if style_extractor is not None:
                     style_features = style_extractor(reshaped_images).to(args.device)
@@ -239,7 +373,7 @@ class Diffusion:
         model.train()
         if args.latent==True:
             latents = 1 / 0.18215 * x
-            image = vae.module.decode(latents).sample
+            image = vae_model.decode(latents).sample
 
             image = (image / 2 + 0.5).clamp(0, 1)
             image = image.cpu().permute(0, 2, 3, 1).numpy()
@@ -255,11 +389,13 @@ class Diffusion:
     def sampling(self, model, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None, run_idx=None):
         model.eval()
         tensor_list = []
+        vae_model = vae.module if hasattr(vae, "module") else vae
         
         with torch.no_grad():
             style_images = None
             text_features = x_text #[x_text]*n
             #print('text features', text_features.shape)
+            # text_features = tokenizer(text_features, padding="max_length", truncation=True, return_tensors="pt", max_length=args.text_max_length).to(args.device)
             text_features = tokenizer(text_features, padding="max_length", truncation=True, return_tensors="pt", max_length=40).to(args.device)
             if args.img_feat == True:
                 #pick random image according to specific style
@@ -267,10 +403,7 @@ class Diffusion:
                     
                     wr_dict = json.load(f)
                 reverse_wr_dict = {v: k for k, v in wr_dict.items()}
-                
-                #key = reverse_wr_dict[value]
                 with open('./utils/splits_words/iam_train_val.txt', 'r') as f:
-                #with open('./utils/splits_words/iam_test.txt', 'r') as f:
                     train_data = f.readlines()
                     train_data = [i.strip().split(',') for i in train_data]
                     style_featur = []
@@ -291,7 +424,7 @@ class Diffusion:
                         else:
                             matching_lines = [line for line in train_data if line[1] == reverse_wr_dict[label_index]]
                             #print('matching lines', matching_lines)
-                            five_styles = matching_lines_style[:5]
+                            # five_styles = matching_lines_style[:5]
                             five_styles = [matching_lines[0]]*5
                             #five_styles = random.sample(matching_lines, 5)
                         print('five_styles', five_styles)
@@ -332,7 +465,7 @@ class Diffusion:
                             cor_im_tens = transform(cor_image).to(args.device)
                             #print('cor image', cor_im_tens.shape)
                             cor_im_tens = cor_im_tens.unsqueeze(0)
-                            cor_images = vae.module.encode(cor_im_tens.to(torch.float32)).latent_dist.sample()
+                            cor_images = vae_model.encode(cor_im_tens.to(torch.float32)).latent_dist.sample()
                             cor_images = cor_images * 0.18215
                             
                         st_imgs = []
@@ -427,7 +560,7 @@ class Diffusion:
         model.train()
         if args.latent==True:
             latents = 1 / 0.18215 * x
-            image = vae.module.decode(latents).sample
+            image = vae_model.decode(latents).sample
 
             image = (image / 2 + 0.5).clamp(0, 1)
             image = image.cpu().permute(0, 2, 3, 1).numpy()
@@ -446,6 +579,7 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, te
     model.train()
     loss_meter = AvgMeter()
     print('Training started....')
+    vae_model = vae.module if hasattr(vae, "module") else vae
     
     for epoch in range(args.epochs):
         print('Epoch:', epoch)
@@ -461,23 +595,25 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, te
             if args.model_name == 'wordstylist':
                 batch_word_embeddings = []
                 for trans in transcr:
-                    word_embedding = label_padding(trans, num_tokens) 
+                    # word_embedding = label_padding(trans, letter2index, num_tokens, tokens["PAD_TOKEN"], OUTPUT_MAX_LEN)
+                    word_embedding = label_padding(trans, num_tokens)
                     word_embedding = np.array(word_embedding, dtype="int64")
                     word_embedding = torch.from_numpy(word_embedding).long() 
                     batch_word_embeddings.append(word_embedding)
                 text_features = torch.stack(batch_word_embeddings)
             else:
+                # text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=args.text_max_length).to(args.device)
                 text_features = tokenizer(transcr, padding="max_length", truncation=True, return_tensors="pt", max_length=40).to(args.device)
             
             if style_extractor is not None:
-                reshaped_images = style_images.reshape(-1, 3, 64, 256)
+                reshaped_images = style_images.reshape(-1, 3, IMG_HEIGHT, IMG_WIDTH)
                 style_features = style_extractor(reshaped_images)
                 
             else:
                 style_features = None
 
             if args.latent == True:
-                images = vae.module.encode(images.to(torch.float32)).latent_dist.sample()
+                images = vae_model.encode(images.to(torch.float32)).latent_dist.sample()
                 images = images * 0.18215
                 latents = images
             
@@ -555,8 +691,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4) 
     parser.add_argument('--model_name', type=str, default='diffusionpen', help='diffusionpen or wordstylist (previous work)')
     parser.add_argument('--level', type=str, default='word', help='word, line')
-    parser.add_argument('--img_size', type=int, default=(64, 256))  
-    parser.add_argument('--dataset', type=str, default='iam', help='iam, gnhk') 
+    parser.add_argument('--img_size', type=int, default=(IMG_HEIGHT, IMG_WIDTH))  
+    parser.add_argument('--dataset', type=str, default='khmer', help='iam, gnhk, khmer') 
     #UNET parameters
     parser.add_argument('--channels', type=int, default=4)
     parser.add_argument('--emb_dim', type=int, default=320)
@@ -578,6 +714,7 @@ def main():
     parser.add_argument('--stable_dif_path', type=str, default='./stable-diffusion-v1-5')
     parser.add_argument('--train_mode', type=str, default='train', help='train, sampling')
     parser.add_argument('--sampling_mode', type=str, default='single_sampling', help='single_sampling (generate single image), paragraph (generate paragraph)')
+    # parser.add_argument('--text_max_length', type=int, default=40)
     
     args = parser.parse_args()
     
@@ -628,10 +765,38 @@ def main():
         rest = len(train_data) - test_size
         test_data, _ = random_split(train_data, [test_size, rest], generator=torch.Generator().manual_seed(42))
         
+    elif args.dataset == 'khmer':
+        print('loading Khmer CSV')
+        dataset_root = os.path.dirname(os.path.abspath(__file__))
+        csv_path = os.path.join(dataset_root, 'image_processing', 'dataset.csv')
+        full_dataset = KhmerDiffusionDataset(csv_path, dataset_root, transforms=transform)
+        style_classes = full_dataset.wclasses
+
+        train_idx, val_idx = split_indices_by_writer(full_dataset.rows, val_ratio=0.2, seed=42)
+        train_data = torch.utils.data.Subset(full_dataset, train_idx)
+        test_data = torch.utils.data.Subset(full_dataset, val_idx)
+
+        character_classes = build_character_classes_from_csv(csv_path) + [' ']
+        # character_classes = build_character_classes_from_csv(csv_path)
+        # if ' ' not in character_classes:
+        #     character_classes.append(' ')
+        #
+        # global char_classes, letter2index, index2letter, tokens, num_tokens
+        # char_classes, letter2index, index2letter = build_label_dictionary(character_classes)
+        # if not tok:
+        #     tokens = {"PAD_TOKEN": char_classes}
+        # else:
+        #     tokens = {"GO_TOKEN": char_classes, "END_TOKEN": char_classes + 1, "PAD_TOKEN": char_classes + 2}
+        # num_tokens = len(tokens.keys())
+
+    # if args.dataset == 'khmer' and args.text_max_length == 40:
+    #     args.text_max_length = 200
+
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
-    character_classes = ['!', '"', '#', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ']
+    if args.dataset != 'khmer':
+        character_classes = ['!', '"', '#', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ']
     
     ######################### MODEL #######################################
     if args.model_name == 'wordstylist':
@@ -641,7 +806,10 @@ def main():
         vocab_size = len(character_classes)
     print('Vocab size: ', vocab_size)
     
-    if args.dataparallel==True:
+    if args.device.startswith('mps'):
+        device_ids = [0]
+        args.dataparallel = False
+    elif args.dataparallel==True:
         device_ids = [3,4]
         print('using dataparallel with device:', device_ids)
     else:
@@ -652,7 +820,8 @@ def main():
     if args.model_name == 'diffusionpen':
         tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
         text_encoder = CanineModel.from_pretrained("google/canine-c")
-        text_encoder = nn.DataParallel(text_encoder, device_ids=device_ids)
+        if args.dataparallel:
+            text_encoder = nn.DataParallel(text_encoder, device_ids=device_ids)
         text_encoder = text_encoder.to(args.device)
         
     else:
@@ -662,7 +831,8 @@ def main():
     if args.unet=='unet_latent':
         unet = UNetModel(image_size = args.img_size, in_channels=args.channels, model_channels=args.emb_dim, out_channels=args.channels, num_res_blocks=args.num_res_blocks, attention_resolutions=(1,1), channel_mult=(1, 1), num_heads=args.num_heads, num_classes=style_classes, context_dim=args.emb_dim, vocab_size=vocab_size, text_encoder=text_encoder, args=args)#.to(args.device)
     
-    unet = DataParallel(unet, device_ids=device_ids)
+    if args.dataparallel:
+        unet = DataParallel(unet, device_ids=device_ids)
     unet = unet.to(args.device)
     
     #print('unet parameters')
@@ -688,7 +858,8 @@ def main():
     if args.latent==True:
         print('VAE is true')
         vae = AutoencoderKL.from_pretrained(args.stable_dif_path, subfolder="vae")
-        vae = DataParallel(vae, device_ids=device_ids)
+        if args.dataparallel:
+            vae = DataParallel(vae, device_ids=device_ids)
         vae = vae.to(args.device)
         # Freeze vae and text_encoder
         vae.requires_grad_(False)
@@ -707,7 +878,8 @@ def main():
     state_dict = {k: v for k, v in state_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
     model_dict.update(state_dict)
     feature_extractor.load_state_dict(model_dict)
-    feature_extractor = DataParallel(feature_extractor, device_ids=device_ids)
+    if args.dataparallel:
+        feature_extractor = DataParallel(feature_extractor, device_ids=device_ids)
     feature_extractor = feature_extractor.to(args.device)
     feature_extractor.requires_grad_(False)
     feature_extractor.eval()
