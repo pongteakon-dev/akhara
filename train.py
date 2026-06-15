@@ -25,6 +25,30 @@ from torchvision.utils import save_image
 from torch.nn import DataParallel
 from transformers import CanineModel, CanineTokenizer
 
+
+def resolve_device(requested_device: str) -> torch.device:
+    requested_device = (requested_device or "auto").strip().lower()
+
+    if requested_device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if requested_device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        return torch.device(requested_device)
+
+    if requested_device == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    return torch.device(requested_device)
+
+
 torch.cuda.empty_cache()
 OUTPUT_MAX_LEN = 95 #+ 2  # <GO>+groundtruth+<END>
 IMG_WIDTH = 960     # 960: Akhara, 256: IAM
@@ -233,6 +257,16 @@ def split_indices_by_writer(rows, val_ratio=0.2, seed=42):
     return train_indices, val_indices
 
 
+def build_style_images_for_writer(full_dataset, writer_id, count=5):
+    matching_rows = [row for row in full_dataset.rows if int(row["writer_id"]) == int(writer_id)]
+    if not matching_rows:
+        raise ValueError(f"No samples found for writer_id={writer_id}")
+
+    selected_rows = random.sample(matching_rows, k=min(count, len(matching_rows)))
+    style_images = [full_dataset._load_and_fit(row["image_path"]) for row in selected_rows]
+    return torch.stack(style_images)
+
+
 def build_character_classes_from_csv(csv_path):
     res = set()
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -386,18 +420,27 @@ class Diffusion:
             x = (x * 255).type(torch.uint8)
         return x
 
-    def sampling(self, model, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None, run_idx=None):
+    def sampling(self, model, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None, run_idx=None, style_images_override=None):
         model.eval()
         tensor_list = []
         vae_model = vae.module if hasattr(vae, "module") else vae
         
         with torch.no_grad():
             style_images = None
+            cor_im = False
+            style_features = None
             text_features = x_text #[x_text]*n
             #print('text features', text_features.shape)
             # text_features = tokenizer(text_features, padding="max_length", truncation=True, return_tensors="pt", max_length=args.text_max_length).to(args.device)
             text_features = tokenizer(text_features, padding="max_length", truncation=True, return_tensors="pt", max_length=40).to(args.device)
-            if args.img_feat == True:
+            if style_images_override is not None:
+                style_images = style_images_override.to(args.device)
+                if style_extractor is not None:
+                    reshaped_images = style_images.reshape(-1, 3, IMG_HEIGHT, IMG_WIDTH)
+                    style_features = style_extractor(reshaped_images).to(args.device)
+                else:
+                    style_features = None
+            elif args.img_feat == True:
                 #pick random image according to specific style
                 with open('./writers_dict_train.json', 'r') as f:
                     
@@ -699,7 +742,7 @@ def main():
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--num_res_blocks', type=int, default=1)
     parser.add_argument('--save_path', type=str, default='./diffusionpen_iam_model_path') 
-    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--wandb_log', type=bool, default=False)
     parser.add_argument('--color', type=bool, default=True)
     parser.add_argument('--unet', type=str, default='unet_latent', help='unet_latent')
@@ -714,9 +757,17 @@ def main():
     parser.add_argument('--stable_dif_path', type=str, default='./stable-diffusion-v1-5')
     parser.add_argument('--train_mode', type=str, default='train', help='train, sampling')
     parser.add_argument('--sampling_mode', type=str, default='single_sampling', help='single_sampling (generate single image), paragraph (generate paragraph)')
+    parser.add_argument('--sample_text', type=str, default='ពូ', help='single word to generate in sampling mode')
+    parser.add_argument('--sample_writer_id', type=int, default=1, help='writer id to use for style images in khmer sampling mode')
     # parser.add_argument('--text_max_length', type=int, default=40)
     
     args = parser.parse_args()
+
+    if args.dataset == 'khmer' and args.save_path == './diffusionpen_iam_model_path':
+        args.save_path = './diffusionpen_khmer'
+
+    device = resolve_device(args.device)
+    args.device = str(device)
     
     print('torch version', torch.__version__)
     
@@ -792,9 +843,11 @@ def main():
     # if args.dataset == 'khmer' and args.text_max_length == 40:
     #     args.text_max_length = 200
 
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    num_workers = int(os.environ.get('DATALOADER_WORKERS', str(args.num_workers)))
 
-    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+
+    test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
     if args.dataset != 'khmer':
         character_classes = ['!', '"', '#', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', ' ']
     
@@ -806,18 +859,21 @@ def main():
         vocab_size = len(character_classes)
     print('Vocab size: ', vocab_size)
     
-    if args.device.startswith('mps'):
+    if str(device).startswith('mps'):
         device_ids = [0]
         args.dataparallel = False
     elif args.dataparallel==True:
         device_ids = [3,4]
         print('using dataparallel with device:', device_ids)
     else:
-        idx = int(''.join(filter(str.isdigit, args.device)))
-        device_ids = [idx]
+        if str(device).startswith('cuda'):
+            idx = int(''.join(filter(str.isdigit, str(device))))
+            device_ids = [idx]
+        else:
+            device_ids = []
     #unet = unet.to(args.device)
 
-    if args.model_name == 'diffusionpen':
+    if args.model_name == 'diffusionpen' or args.model_name == 'akharapen':
         tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
         text_encoder = CanineModel.from_pretrained("google/canine-c")
         if args.dataparallel:
@@ -899,6 +955,37 @@ def main():
         ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
         ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt'))
         ema_model.eval()
+
+        os.makedirs('./image_samples', exist_ok=True)
+
+        if args.dataset == 'khmer':
+            sample_text = args.sample_text
+            sample_writer_id = args.sample_writer_id
+            sample_writer_label = full_dataset.writer_id_to_index[int(sample_writer_id)]
+            labels = torch.tensor([sample_writer_label]).long().to(args.device)
+            style_images_override = build_style_images_for_writer(full_dataset, sample_writer_id, count=5)
+
+            ema_sampled_images = diffusion.sampling(
+                ema_model,
+                vae,
+                n=len(labels),
+                x_text=sample_text,
+                labels=labels,
+                args=args,
+                style_extractor=feature_extractor,
+                noise_scheduler=ddim,
+                transform=transform,
+                character_classes=None,
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                run_idx=None,
+                style_images_override=style_images_override,
+            )
+
+            output_path = os.path.join('./image_samples', f'{sample_text}_writer_{sample_writer_id}.png')
+            save_single_images(ema_sampled_images, output_path, args)
+            print(f'Saved sample to {output_path}')
+            return
         
         if args.sampling_mode == 'single_sampling':
             x_text = ['text', 'word']
@@ -1081,3 +1168,6 @@ if __name__ == "__main__":
     main()
   
   
+
+
+#['ក', 'ខ', 'គ', 'ឃ', 'ង', 'ច', 'ឆ', 'ជ', 'ឈ', 'ញ', 'ដ', 'ឌ', 'ណ', 'ត', 'ថ', 'ទ', 'ធ', 'ន', 'ប', 'ផ', 'ព', 'ភ', 'ម', 'យ', 'រ', 'ល', 'វ', 'ស', 'ហ', 'ឡ', 'អ', 'ឧ', 'ឪ', 'ឯ', 'ា', 'ិ', 'ី', 'ឹ', 'ឺ', 'ុ', 'ូ', 'ួ', 'ើ', 'ៀ', 'េ', 'ែ', 'ៃ', 'ោ', 'ៅ', 'ំ', 'ះ', 'ៈ', '៉', '៊', '់', '៍', '័', '្', '\u200b', ' ']

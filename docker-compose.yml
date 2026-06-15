@@ -1,0 +1,54 @@
+services:
+  style-train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: akhara-style-trainer:latest
+    container_name: akhara-style-trainer
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - ./style_models:/workspace/style_models
+      - ./image_processing:/workspace/image_processing:ro
+    environment:
+      WANDB_MODE: offline
+      PYTHONUNBUFFERED: "1"
+      DATALOADER_WORKERS: "0"
+    command: >
+      python style_encoder_train.py
+      --dataset khmer
+      --mode mixed
+      --device auto
+    shm_size: "8gb"
+    tty: true
+    stdin_open: true
+    restart: "no"
+    gpus: all
+
+  diffusion-train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: akhara-diffusion-trainer:latest
+    container_name: akhara-diffusion-trainer
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - ./diffusionpen_khmer:/workspace/diffusionpen_khmer
+      - ./diffusionpen_iam_model_path:/workspace/diffusionpen_iam_model_path
+      - ./stable-diffusion-v1-5:/workspace/stable-diffusion-v1-5:ro
+      - ./image_processing:/workspace/image_processing:ro
+    environment:
+      WANDB_MODE: offline
+      PYTHONUNBUFFERED: "1"
+      DATALOADER_WORKERS: "0"
+    command: >
+      python train.py
+      --dataset khmer
+      --train_mode train
+      --device auto
+    shm_size: "8gb"
+    tty: true
+    stdin_open: true
+    restart: "no"
+    gpus: all

@@ -24,6 +24,29 @@ import csv
 import random
 
 
+def resolve_device(requested_device: str) -> torch.device:
+    requested_device = (requested_device or "auto").strip().lower()
+
+    if requested_device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if requested_device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
+        return torch.device(requested_device)
+
+    if requested_device == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    return torch.device(requested_device)
+
+
 """
     1. Image Processing Height too small. realistically 96-128px minimum
     2. character_classes are hard coded from IAM transcriptions which only include ASCII not unicode endpoints
@@ -1425,12 +1448,13 @@ def main():
     parser.add_argument('--batch_size', type=int, default=320, help='input batch size for training')
     parser.add_argument('--epochs', type=int, default=20, required=False, help='number of training epochs')
     parser.add_argument('--pretrained', type=bool, default=False, help='use of feature extractor or not')
-    parser.add_argument('--device', type=str, default='cuda:0', help='device to use for training / testing')
+    parser.add_argument('--device', type=str, default='auto', help='device to use for training / testing: auto, cpu, cuda:0, mps')
     parser.add_argument('--save_path', type=str, default='./style_models', help='path to save models')
     parser.add_argument('--mode', type=str, default='mixed', help='mixed for DiffusionPen, triplet for DiffusionPen-triplet, or classification for DiffusionPen-triplet')
     args = parser.parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    device = resolve_device(args.device)
+    args.device = str(device)
     
     #========= Data augmentation and normalization for training =====#
     if os.path.exists(args.save_path) == False:
@@ -1458,16 +1482,12 @@ def main():
             transforms=train_transform,
         )
 
-        train_indices, val_indices = split_indices_by_writer(full_dataset.rows, val_ratio=0.2, seed=42)
-        train_data = torch.utils.data.Subset(full_dataset, train_indices)
-        val_data = torch.utils.data.Subset(
-            KhmerCsvDataset(
-                csv_path=csv_path,
-                basefolder=dataset_root,
-                fixed_size=(384, 960),
-                transforms=val_transform,
-            ),
-            val_indices,
+        validation_size = int(0.2 * len(full_dataset))
+        train_size = len(full_dataset) - validation_size
+        train_data, val_data = random_split(
+            full_dataset,
+            [train_size, validation_size],
+            generator=torch.Generator().manual_seed(42),
         )
 
         print('len train data', len(train_data))
@@ -1477,7 +1497,7 @@ def main():
             train_data,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=int(os.environ.get('DATALOADER_WORKERS', '4')),
             collate_fn=full_dataset.collate_fn,
         )
 
@@ -1485,7 +1505,7 @@ def main():
             val_data,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=int(os.environ.get('DATALOADER_WORKERS', '4')),
             collate_fn=full_dataset.collate_fn,
         )
 

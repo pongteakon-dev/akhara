@@ -41,8 +41,8 @@ except ImportError:
     print("   pip install pytesseract  +  apt/brew install tesseract-ocr")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-OUT_W        = 960
-OUT_H        = 384
+OUT_W        = 256
+OUT_H        = 128
 BORDER_INSET = 4   # px to inset from detected box edge to exclude border line
 
 
@@ -380,7 +380,7 @@ def process_image(img_path, output_dir, writer_id, labels,
             continue
 
         resized  = crop_box(img, box)
-        out_name = f"{word_id}_{writer_id}.png"
+        out_name = f"{writer_id}_{word_id}_{label}.png"
         out_path = output_dir / out_name
         cv2.imwrite(str(out_path), resized)
 
