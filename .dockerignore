@@ -6,3 +6,16 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+image_processing/images/
+image_processing/processed_images/
+image_processing/scanned_pdfs/
+image_processing/images.zip
+style_models/
+diffusionpen_khmer/
+diffusionpen_iam_model_path/
+stable-diffusion-v1-5/
+pdfs_to_print/
+wandb/
+.env
+.env.local
+.vscode/

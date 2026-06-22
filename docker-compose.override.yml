@@ -1,4 +1,0 @@
-services:
-  style-train:
-    environment:
-      DATALOADER_WORKERS: "0"

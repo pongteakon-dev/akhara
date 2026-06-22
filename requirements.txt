@@ -10,3 +10,6 @@ timm
 opencv-python
 scikit-image
 einops
+wandb
+weave
+huggingface_hub

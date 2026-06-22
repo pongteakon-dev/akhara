@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: akhara-style-trainer:latest
+    image: kolbot/akhara-style-trainer:latest
     container_name: akhara-style-trainer
     working_dir: /workspace
     volumes:
@@ -11,7 +11,7 @@ services:
       - ./style_models:/workspace/style_models
       - ./image_processing:/workspace/image_processing:ro
     environment:
-      WANDB_MODE: offline
+      WANDB_API_KEY: ${WANDB_API_KEY}
       PYTHONUNBUFFERED: "1"
       DATALOADER_WORKERS: "0"
     command: >
@@ -19,7 +19,6 @@ services:
       --dataset khmer
       --mode mixed
       --device auto
-    shm_size: "8gb"
     tty: true
     stdin_open: true
     restart: "no"
@@ -29,7 +28,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: akhara-diffusion-trainer:latest
+    image: kolbot/akhara-diffusion-trainer:latest
     container_name: akhara-diffusion-trainer
     working_dir: /workspace
     volumes:
@@ -39,15 +38,14 @@ services:
       - ./stable-diffusion-v1-5:/workspace/stable-diffusion-v1-5:ro
       - ./image_processing:/workspace/image_processing:ro
     environment:
-      WANDB_MODE: offline
+      WANDB_API_KEY: ${WANDB_API_KEY}
       PYTHONUNBUFFERED: "1"
       DATALOADER_WORKERS: "0"
     command: >
-      python train.py
+      python train_test.py
       --dataset khmer
       --train_mode train
       --device auto
-    shm_size: "8gb"
     tty: true
     stdin_open: true
     restart: "no"

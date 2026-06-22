@@ -1,4 +1,5 @@
 import torch
+import wandb
 import torch.nn as nn
 import torchvision.models as models
 from torchvision import transforms
@@ -134,7 +135,7 @@ class WordStyleDataset(Dataset):
         basefolder: str = 'datasets/',                #Root folder
         subset: str = 'all',                          #Name of dataset subset to be loaded. (e.g. 'all', 'train', 'test', 'fold1', etc.)
         segmentation_level: str = 'line',             #Type of data to load ('line' or 'word')
-        fixed_size: tuple =(384, 960),                #Resize inputs to this size, Used to be tuple = (128, None)
+        fixed_size: tuple =(128, 256),                #Resize inputs to this size, Used to be tuple = (128, None)
         transforms: list = None,                      #List of augmentation transform functions to be applied on each input
         character_classes: list = None,               #If 'None', these will be autocomputed. Otherwise, a list of characters is expected.
         ):
@@ -183,17 +184,17 @@ class WordStyleDataset(Dataset):
         img_pos = Image.open(positive).convert('RGB') #image_resize_PIL(positive, height=positive.height // 2)
         img_neg = Image.open(negative).convert('RGB') #image_resize_PIL(negative, height=negative.height // 2)
         
-        if img.height < 384 and img.width < 960:
+        if img.height < 128 and img.width < 256:
             img = img
         else:
             img = image_resize_PIL(img, height=img.height // 2)
         
-        if img_pos.height < 384 and img_pos.width < 960:
+        if img_pos.height < 128 and img_pos.width < 256:
             img_pos = img_pos
         else:
             img_pos = image_resize_PIL(img_pos, height=img_pos.height // 2)
         
-        if img_neg.height < 384 and img_neg.width < 960:
+        if img_neg.height < 128 and img_neg.width < 256:
             img_neg = img_neg
         else:
             img_neg = image_resize_PIL(img_neg, height=img_neg.height // 2)
@@ -329,7 +330,7 @@ class WordLineDataset(Dataset):
         basefolder: str = 'datasets/',                #Root folder
         subset: str = 'all',                          #Name of dataset subset to be loaded. (e.g. 'all', 'train', 'test', 'fold1', etc.)
         segmentation_level: str = 'line',             #Type of data to load ('line' or 'word')
-        fixed_size: tuple =(384, 960),                #Resize inputs to this size, Used to be (128, None)
+        fixed_size: tuple =(128, 256),                #Resize inputs to this size, Used to be (128, None)
         transforms: list = None,                      #List of augmentation transform functions to be applied on each input
         character_classes: list = None,               #If 'None', these will be autocomputed. Otherwise, a list of characters is expected.
         ):
@@ -465,8 +466,8 @@ class WordLineDataset(Dataset):
         #img = centered_PIL(img, (fheight, fwidth), border_value=None).convert('L')
         
             #image = image.resize((256, 128), Image.ANTIALIAS)
-        if img.width < 960:
-            img = ImageOps.pad(img, size=(960, 384), color= "white")#, centering=(0,0)) uncommment to pad right
+        if img.width < 256:
+            img = ImageOps.pad(img, size=(256, 128), color= "white")#, centering=(0,0)) uncommment to pad right
         #print('img', img.mode, img.size)
         
         pixel_values_img = img #self.processor(img, return_tensors="pt").pixel_values
@@ -675,7 +676,7 @@ class KhmerCsvDataset(Dataset):
         self,
         csv_path,
         basefolder,
-        fixed_size=(384, 960),
+        fixed_size=(128, 256),
         transforms=None,
         subset="all",
         seed=42,
@@ -700,7 +701,7 @@ class KhmerCsvDataset(Dataset):
         res = set()
         max_len = 0
         for r in self.rows:
-            transcr = r["label"]
+            transcr = r.get("label")
             res.update(list(transcr))
             max_len = max(max_len, len(transcr))
         res = sorted(list(res))
@@ -733,8 +734,8 @@ class KhmerCsvDataset(Dataset):
 
         fheight, fwidth = self.fixed_size[0], self.fixed_size[1]
 
-        if img.width < 960:
-            img = ImageOps.pad(img, size=(960, 384), color="white")
+        if img.width < 256:
+            img = ImageOps.pad(img, size=(256, 128), color="white")
 
         nheight, nwidth = img.height, img.width
         nheight_pos, nwidth_pos = img_pos.height, img_pos.width
@@ -925,7 +926,7 @@ class IAMDataset_style(WordLineDataset):
                 #print('img shape PIL', img.size)
                 #img = image_resize_PIL(img, height=128)
                 
-                if img.height < 384 and img.width < 960:
+                if img.height < 128 and img.width < 256:
                     img = img
                 else:
                     img = image_resize_PIL(img, height=img.height // 2)
@@ -1217,12 +1218,26 @@ def train_epoch_mixed(train_loader, model, criterion_triplet, criterion_classifi
         loss_meter_class.update(classification_loss.item(), count)
         pbar.set_postfix(mixed_loss=loss_meter.avg, classification_loss=loss_meter_class.avg, triplet_loss=loss_meter_triplet.avg)
         total += img.size(0)
+        
+        wandb.log({
+            "train/batch_loss": loss_meter.avg,
+            "train/batch_triplet": loss_meter_triplet.avg,
+            "train/batch_class": loss_meter_class.avg,
+            "train/batch_accuracy": n_corrects / total,
+        })
     
-    accuracy = n_corrects/total
+    epoch_loss = running_loss/total
+    epoch_acc = n_corrects/total
     print('total', total)
-    print("Training Loss: {:.4f}".format(running_loss/len(train_loader)))
-    print("Training Accuracy: {:.4f}".format(accuracy*100))
-    return running_loss/total #np.mean(running_loss)/total
+    print("Training Loss: {:.4f}".format(running_loss / len(train_loader)))
+    print("Training Accuracy: {:.4f}".format(epoch_acc * 100))
+    
+    wandb.log({
+        "train/epoch_loss":     epoch_loss,
+        "train/epoch_accuracy": epoch_acc,
+    })
+    
+    return epoch_loss #np.mean(running_loss)/total
 
 def val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classification, optimizer, device, args):
     
@@ -1230,6 +1245,8 @@ def val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classificati
     total = 0
     n_corrects = 0
     loss_meter = AvgMeter()
+    loss_meter_triplet = AvgMeter()
+    loss_meter_class = AvgMeter()
     pbar = tqdm(val_loader)
     for i, data in enumerate(pbar):
         
@@ -1255,15 +1272,29 @@ def val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classificati
         running_loss += loss.item()
         count = img.size(0)
         loss_meter.update(loss.item(), count)
-        pbar.set_postfix(mixed_loss=loss_meter.avg)
+        loss_meter_triplet.update(triplet_loss.item(), count)
+        loss_meter_class.update(classification_loss.item(), count)
+        pbar.set_postfix(
+            mixed_loss=loss_meter.avg,
+            triplet_loss=loss_meter_triplet.avg,
+            class_loss=loss_meter_class.avg,
+        )
         total += wid.size(0)
     
+    epoch_loss = running_loss / total
+    epoch_acc  = n_corrects / total
     print('total', total)
-    accuracy = n_corrects/total
-    print("Validation Loss: {:.4f}".format(running_loss/len(val_loader)))
-    print("Validation Accuracy: {:.4f}".format(accuracy*100))
-    return running_loss/total #np.mean(running_loss)/total
+    print("Validation Loss: {:.4f}".format(running_loss / len(val_loader)))
+    print("Validation Accuracy: {:.4f}".format(epoch_acc * 100))
+    
+    wandb.log({
+        "val/epoch_loss":       epoch_loss,
+        "val/epoch_accuracy":   epoch_acc,
+        "val/epoch_triplet":    loss_meter_triplet.avg,
+        "val/epoch_class":      loss_meter_class.avg,
+    })
 
+    return epoch_loss
 
 
 
@@ -1282,9 +1313,16 @@ def train_mixed(model, train_loader, val_loader, criterion_triplet, criterion_cl
         with torch.no_grad():
             val_loss = val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classification, optimizer, device, args)
         
+         # wandb epoch summary (LR + epoch index)
+        wandb.log({
+            "epoch": epoch_i + 1,
+            "lr":    optimizer.param_groups[0]['lr'],
+        })
+        
         if val_loss < best_loss:
             best_loss =val_loss
             torch.save(model.state_dict(), f'{args.save_path}/mixed_{args.dataset}_{args.model}.pth')
+            wandb.save(args.save_path)
             print("Saved Best Model!")
         
         scheduler.step(val_loss)
@@ -1361,83 +1399,7 @@ def train_triplet(model, train_loader, val_loader, criterion, optimizer, schedul
         
         scheduler.step(val_loss)
         
-def get_khmer_character_classes():
-    """
-    Returns a curated list of Khmer Unicode characters for HTR training.
-    Covers the full Khmer Unicode block U+1780–U+17FF
-    """
-    
-    # Core Khmer consonants (U+1780–U+17A2)
-    consonants = [chr(c) for c in range(0x1780, 0x17A3)]
-    
-    # Independent vowels (U+17A3–U+17B3)
-    independent_vowels = [chr(c) for c in range(0x17A3, 0x17B4)]
-    
-    # Dependent vowel signs (U+17B6–U+17C5)
-    dependent_vowels = [chr(c) for c in range(0x17B6, 0x17C6)]
-    
-    # Various signs
-    signs = [chr(c) for c in range(0x17C6, 0x17D4)]
-    
-    # Punctuation (U+17D4–U+17DA)
-    punctuation = [chr(c) for c in range(0x17D4, 0x17DB)]
-    
-    # Currency symbol (Riel) U+17DB
-    currency = ['\u17DB']
-    
-    # Khmer digits (U+17E0–U+17E9)
-    digits = [chr(c) for c in range(0x17E0, 0x17EA)]
-    
-    # Khmer lunar digits (U+17F0–U+17F9)
-    lunar_digits = [chr(c) for c in range(0x17F0, 0x17FA)]
-    
-    # Subscript consonants (COENG form) — CRITICAL for Khmer
-    # These are the "foot" forms rendered below base consonants
-    # Represented as U+17D2 (COENG) + consonant sequences
-    # U+17D2 is the trigger character; include it explicitly
-    coeng = ['\u17D2']
-    
-    # Zero Width Non-Joiner / Zero Width Joiner (rendering control)
-    joiners = ['\u200B', '\u200C', '\u200D']
-    
-    # Space and padding
-    space = [' ']
-    
-    all_classes = (
-        consonants +
-        independent_vowels +
-        dependent_vowels +
-        signs +
-        punctuation +
-        currency +
-        digits +
-        lunar_digits +
-        coeng +
-        # joiners +   # not sure if using
-        space
-    )
-    
-    seen = set()
-    unique_classes = []
-    for c in all_classes:
-        if c not in seen:
-            seen.add(c)
-            unique_classes.append(c)
-    
-    return unique_classes
 
-def get_khmer_character_classes_with_coeng():
-    base = get_khmer_character_classes()
-    
-    # Generate all COENG + consonant bigrams as atomic tokens
-    coeng = '\u17D2'
-    consonants = [chr(c) for c in range(0x1780, 0x17A3)]
-    coeng_sequences = [coeng + c for c in consonants]
-    
-    # Remove standalone COENG since it's now always part of a bigram
-    base = [c for c in base if c != coeng]
-    
-    return base + coeng_sequences
 
 def main():
     
@@ -1452,6 +1414,12 @@ def main():
     parser.add_argument('--save_path', type=str, default='./style_models', help='path to save models')
     parser.add_argument('--mode', type=str, default='mixed', help='mixed for DiffusionPen, triplet for DiffusionPen-triplet, or classification for DiffusionPen-triplet')
     args = parser.parse_args()
+    wandb.login(key=os.environ.get("WANDB_API_KEY"))
+    wandb.init(
+        project="diffusionpen-khmer",
+        name=f"{args.mode}_{args.model}_{args.dataset}",
+        config=vars(args)
+    )
 
     device = resolve_device(args.device)
     args.device = str(device)
@@ -1478,7 +1446,7 @@ def main():
         full_dataset = KhmerCsvDataset(
             csv_path=csv_path,
             basefolder=dataset_root,
-            fixed_size=(384, 960),
+            fixed_size=(128, 256),
             transforms=train_transform,
         )
 
@@ -1525,16 +1493,13 @@ def main():
     #                         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     #                         ])
     #     khmer_classes = get_khmer_character_classes_with_coeng()
-    #     train_data = myDataset(dataset_folder, 'train', 'word', fixed_size=(1 * 384, 960), transforms=train_transform)
+    #     train_data = myDataset(dataset_folder, 'train', 'word', fixed_size=(1 * 128, 256), transforms=train_transform)
     #     validation_size = int(0.2 * len(train_data))
     #     train_size = len(train_data) - validation_size
     #     train_data, val_data = random_split(train_data, [train_size, validation_size], generator=torch.Generator().manual_seed(42))
     #     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
     #     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
     #     style_classes = 2
-    
-    
-    
     
     use_mixed_encoder = args.mode == 'mixed'
 

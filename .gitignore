@@ -5,3 +5,6 @@ __pycache__/
 processed_images/
 images/
 pdfs_to_print/
+wandb/
+stable-diffusion-v1-5/
+utils/__pycache__/
